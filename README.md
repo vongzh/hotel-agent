@@ -1,6 +1,6 @@
-# StayOTA Hotel Refund Agent（MEAI + Agent Framework）
+# StayOTA Agent（酒店 OTA Agent）
 
-结合 `hotel`（工作台）+ `Hotel-refund`（受控 Workflow / 33 Tool / A–L / Eval）的 .NET 10 实现。
+本仓库是**独立的酒店 OTA Agent**（StayOTA Agent）：面向酒店订单场景的受控 AI Agent，覆盖意图理解、政策检索、规则/风险、33 Tool 写门禁、A–L Workflow 与离线 Eval。默认演示场景为退款处理，可扩展为更多 OTA 能力。
 
 技术栈：**.NET 10 + Microsoft.Extensions.AI + Microsoft Agent Framework + Vue3（Vben 风格）+ PostgreSQL + Redis**
 
@@ -8,7 +8,7 @@
 
 | 层 | 实现 |
 | --- | --- |
-| 模块布局 | `StayOta.Agent.Abstractions` + `StayOta.Agent` + `Plugins.Refund` + `StayOta.Agent.Host`（对齐 Scheduling） |
+| 模块布局 | `StayOta.Agent.Abstractions` + `StayOta.Agent` + `Plugins.Refund` + `StayOta.Agent.Host` |
 | 模型接入 | `IChatClient`（默认 `DeterministicRefundChatClient`，可换成 Azure OpenAI / Foundry） |
 | Agent | `ChatClientAgent`（`Microsoft.Agents.AI`） |
 | A–L 编排 | `WorkflowBuilder` + `InProcessExecution`（`Microsoft.Agents.AI.Workflows`） |
@@ -16,8 +16,8 @@
 | FunctionApproval | `ToolApprovalRequestContent` → `POST /api/agent/approvals` |
 | MCP | `MapMcp("/mcp")` + `RefundMcpTools`；`Production:Mode=Mcp` 可拉外部工具 |
 | 生产直连 | `Production:Mode=Mock\|Http\|Mcp`（Http 走 BaseUrl 订单/政策 API） |
-| 领域门禁 | `ToolGateway`（确认令牌 / 版本 / 幂等 / 审计）— 保留自研 |
-| 规则 / 风险 / Eval | Domain + Verifier — 保留自研 |
+| 领域门禁 | `ToolGateway`（确认令牌 / 版本 / 幂等 / 审计） |
+| 规则 / 风险 / Eval | Domain + Verifier |
 | PG 隔离 | `AgentStorage:Schema=agent_refund`（默认同库 schema 隔离） |
 
 ## 已覆盖能力
@@ -60,9 +60,7 @@ curl -X POST http://127.0.0.1:5088/api/eval/run
 curl -X POST http://127.0.0.1:5088/api/workflows/run-all
 ```
 
-## 正式收口与 StayOTA 模块融入
-
-### Production 开关（本服务）
+## Production 配置
 
 ```bash
 export ASPNETCORE_ENVIRONMENT=Production
@@ -73,16 +71,10 @@ export Production__Mode=Http
 export Production__BaseUrl='https://orders.internal/'
 ```
 
-- `DemoEnabled=false`：禁止启动删库、`ResetDemo`、Eval/Workflow 演示端、开放确认签发  
+- `DemoEnabled=false`：禁止启动删库、`ResetDemo`、Eval/Workflow 演示端、开放确认签发
 - Http/Mcp：**不**静默回退 Mock；AI 失败不静默降级 Deterministic（除非显式允许）
 
-### 并入 StayOTA
-
-详见 [`docs/STAYOTA-INTEGRATION.md`](./docs/STAYOTA-INTEGRATION.md)：
-
-- **后端**：独立 Refund Agent 服务（可过渡同 Host 模块挂载）
-- **前端**：本仓 Vue 仅 Demo/联调；正式页后续按 StayOTA 后台风格重做
-- **主站需提供**：鉴权网关、订单/政策只读契约、写回执与幂等、可观测性
+与主站订单/鉴权等系统对接时，可参考可选说明 [`docs/STAYOTA-INTEGRATION.md`](./docs/STAYOTA-INTEGRATION.md)（非本仓运行前置依赖）。
 
 ## AI 提供商
 
