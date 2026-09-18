@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/Modules/Agent/">
+    <Project Path="src/Modules/Agent/StayOta.Agent.Abstractions/StayOta.Agent.Abstractions.csproj" />
+    <Project Path="src/Modules/Agent/StayOta.Agent/StayOta.Agent.csproj" />
+    <Project Path="src/Modules/Agent/StayOta.Agent.Plugins.Refund/StayOta.Agent.Plugins.Refund.csproj" />
+  </Folder>
+  <Folder Name="/src/Hosts/">
+    <Project Path="src/Hosts/StayOta.Agent.Host/StayOta.Agent.Host.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/StayOta.Agent.Tests/StayOta.Agent.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,58 @@
+using StayOta.Agent.Abstractions.Contracts;
+using StayOta.Agent.Abstractions.Domain;
+
+namespace StayOta.Agent.Abstractions.Ai;
+
+/// <summary>
+/// Ambient call context for MEAI <see cref="Microsoft.Extensions.AI.AIFunction"/> wrappers around <see cref="IToolGateway"/>.
+/// </summary>
+public sealed class ToolInvocationContext
+{
+    private static readonly AsyncLocal<ToolInvocationContext?> CurrentLocal = new();
+
+    public static ToolInvocationContext? Current => CurrentLocal.Value;
+
+    public required string TraceId { get; init; }
+    public required string UserId { get; init; }
+    public string? OrderId { get; init; }
+    public string? CaseId { get; init; }
+    public required RiskLevel RiskLevel { get; init; }
+    public required string ConversationState { get; init; }
+    public IDictionary<string, object?> Arguments { get; init; } = new Dictionary<string, object?>();
+    public string? ConfirmationToken { get; init; }
+    public string? IdempotencyKey { get; init; }
+    public int? ExpectedOrderVersion { get; init; }
+    public ToolAccess Access { get; init; } = ToolAccess.Read;
+
+    public ToolCall ToToolCall(string toolName) => new(
+        TraceId, toolName, Access, UserId, OrderId, CaseId, RiskLevel, ConversationState,
+        Arguments, ConfirmationToken, IdempotencyKey, ExpectedOrderVersion);
+
+    public static IDisposable Push(ToolInvocationContext context)
+    {
+        var prior = CurrentLocal.Value;
+        CurrentLocal.Value = context;
+        return new Popper(prior);
+    }
+
+    public static IDisposable Push(ToolCall call) =>
+        Push(new ToolInvocationContext
+        {
+            TraceId = call.TraceId,
+            UserId = call.UserId,
+            OrderId = call.OrderId,
+            CaseId = call.CaseId,
+            RiskLevel = call.RiskLevel,
+            ConversationState = call.ConversationState,
+            Arguments = call.Arguments,
+            ConfirmationToken = call.ConfirmationToken,
+            IdempotencyKey = call.IdempotencyKey,
+            ExpectedOrderVersion = call.ExpectedOrderVersion,
+            Access = call.Access
+        });
+
+    private sealed class Popper(ToolInvocationContext? prior) : IDisposable
+    {
+        public void Dispose() => CurrentLocal.Value = prior;
+    }
+}

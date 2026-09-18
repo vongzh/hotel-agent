@@ -1,0 +1,80 @@
+using System.ClientModel;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using OllamaSharp;
+using OpenAI;
+using StayOta.Agent.Abstractions.Options;
+
+namespace StayOta.Agent.Ai;
+
+public interface IChatClientFactory
+{
+    IChatClient Create();
+    string ProviderName { get; }
+}
+
+public sealed class ChatClientFactory(
+    IOptions<AiOptions> options,
+    ILogger<ChatClientFactory> logger) : IChatClientFactory
+{
+    public string ProviderName => ResolveProvider();
+
+    public IChatClient Create()
+    {
+        var opts = options.Value;
+        var provider = ResolveProvider();
+        logger.LogInformation("Creating IChatClient provider={Provider}", provider);
+
+        return provider switch
+        {
+            "openai" => CreateOpenAi(opts.OpenAI),
+            "ollama" => CreateOllama(opts.Ollama),
+            _ => new DeterministicRefundChatClient()
+        };
+    }
+
+    private string ResolveProvider()
+    {
+        var configured = options.Value.Provider?.Trim() ?? "Deterministic";
+        var env = Environment.GetEnvironmentVariable("AI_PROVIDER");
+        if (!string.IsNullOrWhiteSpace(env))
+            configured = env;
+        return configured.Trim().ToLowerInvariant();
+    }
+
+    private static IChatClient CreateOpenAi(OpenAiOptions cfg)
+    {
+        var apiKey = FirstNonEmpty(cfg.ApiKey, Environment.GetEnvironmentVariable("OPENAI_API_KEY"));
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException("Ai:Provider=OpenAI 需要 Ai:OpenAI:ApiKey 或环境变量 OPENAI_API_KEY");
+
+        OpenAIClient client;
+        var endpoint = FirstNonEmpty(cfg.Endpoint, Environment.GetEnvironmentVariable("OPENAI_ENDPOINT"));
+        if (!string.IsNullOrWhiteSpace(endpoint))
+        {
+            client = new OpenAIClient(new ApiKeyCredential(apiKey), new OpenAIClientOptions
+            {
+                Endpoint = new Uri(endpoint!)
+            });
+        }
+        else
+        {
+            client = new OpenAIClient(apiKey);
+        }
+
+        var model = FirstNonEmpty(cfg.Model, Environment.GetEnvironmentVariable("OPENAI_MODEL")) ?? "gpt-4o-mini";
+        return client.GetChatClient(model).AsIChatClient();
+    }
+
+    private static IChatClient CreateOllama(OllamaOptions cfg)
+    {
+        var endpoint = FirstNonEmpty(cfg.Endpoint, Environment.GetEnvironmentVariable("OLLAMA_ENDPOINT"))
+                       ?? "http://127.0.0.1:11434";
+        var model = FirstNonEmpty(cfg.Model, Environment.GetEnvironmentVariable("OLLAMA_MODEL")) ?? "llama3.2";
+        return new OllamaApiClient(new Uri(endpoint), model);
+    }
+
+    private static string? FirstNonEmpty(params string?[] values) =>
+        values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+}

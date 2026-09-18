@@ -1,7 +1,15 @@
-*.ss~
-*.ss#*
-.#*.ss
+.DS_Store
+.idea/
+.vscode/
 
-*.scm~
-*.scm#*
-.#*.scm
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+**/bin/
+**/obj/
+**/.vs/
+*.user
+*.swp

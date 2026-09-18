@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: stayota
+      POSTGRES_PASSWORD: stayota
+      POSTGRES_DB: stayota_refund
+    ports:
+      - "5432:5432"
+    volumes:
+      - stayota_pg:/var/lib/postgresql/data
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+volumes:
+  stayota_pg:

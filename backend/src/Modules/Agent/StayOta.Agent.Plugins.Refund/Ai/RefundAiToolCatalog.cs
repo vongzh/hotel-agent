@@ -1,0 +1,69 @@
+using Microsoft.Extensions.AI;
+using StayOta.Agent.Abstractions.Ai;
+using StayOta.Agent.Abstractions.Contracts;
+using StayOta.Agent.Plugins.Refund.Services;
+
+namespace StayOta.Agent.Plugins.Refund.Ai;
+
+/// <summary>
+/// Exposes the 33 domain tools as MEAI <see cref="AIFunction"/>s.
+/// Confirm-required writes are wrapped with <see cref="ApprovalRequiredAIFunction"/> for ChatClientAgent HITL.
+/// Domain gates (confirm / version / idempotency / audit) remain in <see cref="IToolGateway"/>.
+/// </summary>
+public sealed class RefundAiToolCatalog(IToolGateway gateway, IRefundDataStore store) : IRefundAiToolCatalog
+{
+    private static readonly HashSet<string> ConfirmRequired =
+    [
+        "submit_cancellation", "submit_order_change", "accept_supplier_offer", "reserve_mock_alternative"
+    ];
+
+    private readonly Lazy<Dictionary<string, AIFunction>> _functions = new(() => BuildFunctions(gateway, store));
+
+    public IReadOnlyDictionary<string, AIFunction> Functions => _functions.Value;
+
+    public IReadOnlyList<AITool> GetAiTools(bool requireApprovalForWrites = true)
+    {
+        if (!requireApprovalForWrites)
+            return _functions.Value.Values.Cast<AITool>().ToList();
+
+        return _functions.Value.Select(kv =>
+            ConfirmRequired.Contains(kv.Key)
+                ? (AITool)new ApprovalRequiredAIFunction(kv.Value)
+                : kv.Value).ToList();
+    }
+
+    public Task<ToolResult> InvokeAsync(ToolCall call, CancellationToken ct = default)
+    {
+        using var _ = ToolInvocationContext.Push(call);
+        return gateway.InvokeAsync(call, ct);
+    }
+
+    private static Dictionary<string, AIFunction> BuildFunctions(IToolGateway gateway, IRefundDataStore store)
+    {
+        var map = new Dictionary<string, AIFunction>(StringComparer.Ordinal);
+        foreach (var contract in store.GetToolContracts())
+        {
+            var name = contract.Name;
+            var purpose = string.IsNullOrWhiteSpace(contract.Purpose) ? name : contract.Purpose;
+            map[name] = AIFunctionFactory.Create(
+                async (AIFunctionArguments args, CancellationToken ct) =>
+                {
+                    var ambient = ToolInvocationContext.Current
+                                  ?? throw new InvalidOperationException($"No ToolInvocationContext for {name}");
+                    var merged = new Dictionary<string, object?>(ambient.Arguments);
+                    foreach (var kv in args)
+                        merged[kv.Key] = kv.Value;
+
+                    var call = ambient.ToToolCall(name) with { Arguments = merged };
+                    var result = await gateway.InvokeAsync(call, ct);
+                    if (!result.Allowed || !result.Success)
+                        throw new InvalidOperationException(result.DenyReason ?? $"{name} denied");
+                    return result.Data ?? new { ok = true };
+                },
+                name,
+                purpose);
+        }
+
+        return map;
+    }
+}
