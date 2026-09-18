@@ -207,12 +207,8 @@ public sealed class AgentOrchestrator(
             ["action"] = decision.Action
         };
 
-        // Drive ChatClientAgent: dialogue + official FunctionApproval for confirm-required writes.
-        var plannedForAgent = new List<string>();
-        if (deferWriteToFunctionApproval)
-            plannedForAgent.Add(writeToolName);
-        else if (executed.Count > 0)
-            plannedForAgent.AddRange(executed.Take(2));
+        // Agent selects tools (Deterministic planner / LLM). Orchestrator only hints write HITL.
+        var plannedForAgent = Array.Empty<string>();
 
         var agentTurn = await conversation.RunTurnAsync(new AgentTurnRequest(
             request.Message,
@@ -230,14 +226,16 @@ public sealed class AgentOrchestrator(
             ambient,
             confirmationToken,
             request.IdempotencyKey ?? (deferWriteToFunctionApproval ? $"idem-{scenario.ScenarioId}-{order.OrderId}-{writeToolName}" : null),
-            deferWriteToFunctionApproval ? order.Version : null), ct);
+            deferWriteToFunctionApproval ? order.Version : null,
+            request.AgentSessionId,
+            AllowAutonomousToolSelection: true), ct);
 
         steps.Add(new(
             "Agent 驱动",
             agentTurn.AgentDriven ? "success" : "warning",
             agentTurn.HasPendingApprovals
-                ? $"FunctionApproval 待批 ×{agentTurn.PendingApprovals.Count}"
-                : $"provider={agentHost.ProviderName}, tools={string.Join(',', agentTurn.ToolsInvoked)}"));
+                ? $"FunctionApproval 待批 ×{agentTurn.PendingApprovals.Count}; session={agentTurn.SessionId}"
+                : $"provider={agentHost.ProviderName}, tools={string.Join(',', agentTurn.ToolsInvoked)}, session={agentTurn.SessionId}"));
 
         foreach (var t in agentTurn.ToolsInvoked)
         {
@@ -474,12 +472,29 @@ public sealed class EvalRunner(IRefundDataStore store, IAgentOrchestrator orches
         }
 
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
-        return doc.RootElement.GetProperty("cases").EnumerateArray().Select(c =>
-            new EvalCaseDto(
-                c.GetProperty("id").GetString()!,
-                c.GetProperty("message").GetString()!,
-                c.GetProperty("expected_scenario").GetString()!,
-                c.GetProperty("risk_level").GetString()!)).ToList();
+        return doc.RootElement.GetProperty("cases").EnumerateArray().Select(ParseCase).ToList();
+    }
+
+    private static EvalCaseDto ParseCase(JsonElement c)
+    {
+        static List<string>? StrList(JsonElement el, string name) =>
+            el.TryGetProperty(name, out var arr) && arr.ValueKind == JsonValueKind.Array
+                ? arr.EnumerateArray().Select(x => x.GetString()!).Where(s => !string.IsNullOrWhiteSpace(s)).ToList()
+                : null;
+
+        decimal? Dec(JsonElement el, string name) =>
+            el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDecimal() : null;
+
+        return new EvalCaseDto(
+            c.GetProperty("id").GetString()!,
+            c.GetProperty("message").GetString()!,
+            c.GetProperty("expected_scenario").GetString()!,
+            c.GetProperty("risk_level").GetString()!,
+            StrList(c, "expected_tools_subsequence"),
+            StrList(c, "forbidden_reply_substrings"),
+            c.TryGetProperty("expected_action", out var act) ? act.GetString() : null,
+            Dec(c, "min_refund_amount"),
+            Dec(c, "max_fee_amount"));
     }
 
     public async Task<IReadOnlyList<EvalResultDto>> RunAllAsync(CancellationToken ct = default)
@@ -495,9 +510,36 @@ public sealed class EvalRunner(IRefundDataStore store, IAgentOrchestrator orches
             {
                 try
                 {
-                    var decision = await orchestrator.HandleAsync(new AgentMessageRequest(c.Message, c.ExpectedScenario, ResetDemo: false), ct);
-                    detail = $"{decision.Action}/{decision.CaseStatus}";
-                    passed = decision.ScenarioId == c.ExpectedScenario;
+                    var decision = await orchestrator.HandleAsync(
+                        new AgentMessageRequest(c.Message, c.ExpectedScenario, ResetDemo: false), ct);
+                    var violations = new List<string>();
+                    if (decision.ScenarioId != c.ExpectedScenario)
+                        violations.Add($"scenario={decision.ScenarioId}");
+                    if (!string.IsNullOrWhiteSpace(c.ExpectedAction) &&
+                        !string.Equals(decision.Action, c.ExpectedAction, StringComparison.Ordinal))
+                        violations.Add($"action={decision.Action} expected={c.ExpectedAction}");
+                    if (c.ExpectedToolsSubsequence is { Count: > 0 } &&
+                        !IsSubsequence(c.ExpectedToolsSubsequence, decision.ToolSequence))
+                        violations.Add($"tools missing subsequence [{string.Join(',', c.ExpectedToolsSubsequence)}]");
+                    if (c.ForbiddenReplySubstrings is { Count: > 0 })
+                    {
+                        foreach (var bad in c.ForbiddenReplySubstrings)
+                        {
+                            if (decision.Reply.Contains(bad, StringComparison.Ordinal))
+                                violations.Add($"forbidden reply contains '{bad}'");
+                        }
+                    }
+                    if (c.MinRefundAmount is not null &&
+                        (decision.RefundAmount is null || decision.RefundAmount < c.MinRefundAmount))
+                        violations.Add($"refund={decision.RefundAmount} < min {c.MinRefundAmount}");
+                    if (c.MaxFeeAmount is not null &&
+                        decision.FeeAmount is not null && decision.FeeAmount > c.MaxFeeAmount)
+                        violations.Add($"fee={decision.FeeAmount} > max {c.MaxFeeAmount}");
+
+                    passed = violations.Count == 0;
+                    detail = passed
+                        ? $"{decision.Action}/{decision.CaseStatus}; tools={decision.ToolSequence.Count}"
+                        : string.Join("; ", violations);
                 }
                 catch (Exception ex)
                 {
@@ -509,5 +551,15 @@ public sealed class EvalRunner(IRefundDataStore store, IAgentOrchestrator orches
             results.Add(new EvalResultDto(c.Id, c.Message, c.ExpectedScenario, routed, passed, detail));
         }
         return results;
+    }
+
+    private static bool IsSubsequence(IReadOnlyList<string> expected, IReadOnlyList<string> actual)
+    {
+        var i = 0;
+        foreach (var item in actual)
+        {
+            if (i < expected.Count && item == expected[i]) i++;
+        }
+        return i == expected.Count;
     }
 }

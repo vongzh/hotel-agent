@@ -3,7 +3,7 @@
     <div class="workspace-heading">
       <div>
         <h1>智能处理台</h1>
-        <p>结论、金额与权限来自规则与 Tool；模型只负责理解与表达。</p>
+        <p>结论、金额与权限来自规则与 Tool；模型侧自主选 Tool，同会话可多轮续跑。</p>
       </div>
       <button class="ghost-btn" :disabled="loading" @click="resetAndRun">重置当前场景</button>
     </div>
@@ -402,6 +402,13 @@ async function run(payload: Record<string, unknown>) {
   errorText.value = ''
   userMessage.value = String(payload.message || '')
   try {
+    const resumeSession =
+      !payload.resetDemo &&
+      decision.value?.agentSessionId &&
+      payload.scenarioId === activeId.value
+    if (resumeSession) {
+      payload = { ...payload, agentSessionId: decision.value!.agentSessionId }
+    }
     decision.value = await runAgentMessage(payload)
   } catch (e: unknown) {
     const err = e as { response?: { data?: { message?: string } } }

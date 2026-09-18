@@ -1,17 +1,20 @@
 using System.Runtime.CompilerServices;
-using System.Text.Json;
 using Microsoft.Extensions.AI;
 
 namespace StayOta.Agent.Ai;
 
 /// <summary>
 /// Offline / demo <see cref="IChatClient"/> that drives tool calling without a remote LLM.
-/// Swap this registration for Azure OpenAI / Foundry clients when going live.
+/// When <see cref="PlannedTools"/> is empty, selects tools via <see cref="ToolIntentPlanner"/>.
 /// </summary>
 public sealed class DeterministicRefundChatClient : IChatClient
 {
     public static AsyncLocal<IReadOnlyList<string>?> PlannedTools { get; } = new();
     public static AsyncLocal<string?> FinalReply { get; } = new();
+    public static AsyncLocal<string?> UserMessage { get; } = new();
+    public static AsyncLocal<string?> ConversationState { get; } = new();
+    public static AsyncLocal<string?> PreferredWriteTool { get; } = new();
+    public static AsyncLocal<bool> AllowAutonomousToolSelection { get; } = new();
 
     public ChatClientMetadata Metadata { get; } = new("deterministic", new Uri("local://stayota-refund-agent"));
 
@@ -34,7 +37,6 @@ public sealed class DeterministicRefundChatClient : IChatClient
         var list = messages.ToList();
         var completed = list.SelectMany(m => m.Contents).OfType<FunctionResultContent>()
             .Select(f => f.CallId).ToHashSet(StringComparer.Ordinal);
-        var planned = PlannedTools.Value ?? [];
         var tools = options?.Tools?.OfType<AIFunction>()
                         .GroupBy(t => t.Name, StringComparer.Ordinal)
                         .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal)
@@ -42,8 +44,11 @@ public sealed class DeterministicRefundChatClient : IChatClient
         var toolNames = options?.Tools?
             .Select(t => t.Name)
             .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Cast<string>()
             .ToHashSet(StringComparer.Ordinal)
             ?? new HashSet<string>(StringComparer.Ordinal);
+
+        var planned = ResolvePlannedTools(toolNames);
 
         foreach (var toolName in planned)
         {
@@ -63,6 +68,22 @@ public sealed class DeterministicRefundChatClient : IChatClient
         return Task.FromResult(new ChatResponse([
             new ChatMessage(ChatRole.Assistant, reply)
         ]));
+    }
+
+    private static IReadOnlyList<string> ResolvePlannedTools(IReadOnlyCollection<string> available)
+    {
+        var explicitPlan = PlannedTools.Value;
+        if (explicitPlan is { Count: > 0 })
+            return explicitPlan;
+
+        if (!AllowAutonomousToolSelection.Value)
+            return [];
+
+        return ToolIntentPlanner.Select(
+            UserMessage.Value ?? "",
+            ConversationState.Value ?? "",
+            available,
+            PreferredWriteTool.Value);
     }
 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(

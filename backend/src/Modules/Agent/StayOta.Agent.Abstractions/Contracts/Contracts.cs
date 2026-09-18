@@ -14,7 +14,9 @@ public sealed record AgentMessageRequest(
     bool ConfirmWrite = false,
     string? ConfirmationToken = null,
     string? IdempotencyKey = null,
-    bool ResetDemo = false);
+    bool ResetDemo = false,
+    /// <summary>Resume ChatClientAgent session across turns when set.</summary>
+    string? AgentSessionId = null);
 
 public sealed record DecisionStepDto(string Step, string Status, string Detail, double? Score = null);
 
@@ -113,7 +115,17 @@ public sealed record ScenarioDto(
     string ExpectedRoute,
     IReadOnlyList<string> RequiredTools);
 
-public sealed record EvalCaseDto(string Id, string Message, string ExpectedScenario, string RiskLevel);
+public sealed record EvalCaseDto(
+    string Id,
+    string Message,
+    string ExpectedScenario,
+    string RiskLevel,
+    IReadOnlyList<string>? ExpectedToolsSubsequence = null,
+    IReadOnlyList<string>? ForbiddenReplySubstrings = null,
+    string? ExpectedAction = null,
+    decimal? MinRefundAmount = null,
+    decimal? MaxFeeAmount = null);
+
 public sealed record EvalResultDto(string Id, string Message, string ExpectedScenario, string ActualScenario, bool Passed, string? Detail);
 
 public sealed record ConfirmActionRequest(string CaseId, string OrderId, int OrderVersion, string Action, string IdempotencyKey);
