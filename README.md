@@ -31,9 +31,11 @@
 - Tool `allowed_conversation_states` 白名单门禁
 - Verifier 决策/工作流断言
 - 前端三页：Agent 设计 / 智能处理台 / 运营看板
-- ChatClientAgent 真正驱动对话（Deterministic / OpenAI / Ollama）
+- ChatClientAgent 真正驱动对话（Deterministic / OpenAI / Ollama）；Deterministic 可按用户话自主选 Tool
+- 多轮 Session 续跑：请求带 `agentSessionId` 即复用序列化会话
 - 官方 FunctionApproval 流（待批 UI + `/api/agent/approvals`）
 - MCP 暴露 `/mcp` + 生产直连 `Mock|Http|Mcp`
+- 离线 Eval 支持工具子序列 / 动作 / 金额 / 禁语断言
 
 ## 启动
 

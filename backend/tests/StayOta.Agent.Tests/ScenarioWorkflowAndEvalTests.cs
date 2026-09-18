@@ -47,14 +47,37 @@ public class EvalRunnerTests
         public Task<AgentDecisionDto> HandleAsync(AgentMessageRequest request, CancellationToken ct = default)
         {
             var scenario = request.ScenarioId ?? "A";
+            var action = scenario switch
+            {
+                "C" => "ExplainProgress",
+                "E" or "K" or "L" => "HumanHandoff",
+                "D" => "Recovery",
+                "I" => "ChangeOrder",
+                "J" => "FinanceReview",
+                "G" => "RequestEvidence",
+                "H" => "ServiceDispute",
+                "F" => "RequestInformation",
+                _ => "ConfirmCancel"
+            };
+            var tools = scenario switch
+            {
+                "C" => new List<string> { "list_user_orders", "get_order_detail", "get_refund_status", "get_payment_events" },
+                "E" => new List<string> { "list_user_orders", "get_order_detail", "create_human_handoff" },
+                _ => new List<string> { "list_user_orders", "get_order_detail", "get_policy_snapshot", "calculate_refund_quote" }
+            };
+            var reply = scenario == "C"
+                ? "退款仍在渠道处理中，请继续等待。"
+                : "确认后可取消，费用以报价为准。";
+            var refund = scenario is "A" or "B" or "C" ? 100m : (decimal?)null;
+            var fee = scenario == "A" ? 0m : scenario == "B" ? 50m : 0m;
             var order = new HotelOrderDto(
                 $"ORD-{scenario}-001", "demo", DateOnly.FromDateTime(DateTime.Today),
                 DateOnly.FromDateTime(DateTime.Today.AddDays(1)), 100, "CNY", "CONFIRMED", false,
                 "POL", 1, "room", 1);
             var dto = new AgentDecisionDto(
                 "t", "r", $"CASE-{scenario}-001", scenario, "intent", 0.9,
-                StayOta.Agent.Abstractions.Domain.RiskLevel.L1, 10, "ConfirmCancel",
-                "c", "p", "copy", 100, 0, "reply", "DECISION_READY", "OPEN",
+                StayOta.Agent.Abstractions.Domain.RiskLevel.L1, 10, action,
+                "c", "p", "copy", refund, fee, reply, "DECISION_READY", "OPEN",
                 [
                     new("意图识别", "success", "a"),
                     new("槽位提取", "success", "b"),
@@ -66,7 +89,7 @@ public class EvalRunnerTests
                 ],
                 new Dictionary<string, string>(),
                 [new("P", "t", 0.9, "s")],
-                [], null, order, true, []);
+                tools, null, order, true, []);
             return Task.FromResult(dto);
         }
 

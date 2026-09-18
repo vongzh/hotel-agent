@@ -30,15 +30,49 @@ public sealed class AgentConversationService(
             Access = ToolAccess.Read
         });
 
+        // Prefer empty orchestrator plan so Deterministic/LLM selects tools; only force write for HITL.
         var planned = request.PlannedTools.ToList();
         if (request.RequireWriteApproval && !string.IsNullOrWhiteSpace(request.WriteToolName))
-            planned.Add(request.WriteToolName!);
+        {
+            // Write stays approval-gated; do not auto-invoke — ApprovalRequiredAIFunction will surface HITL.
+            planned.RemoveAll(t => t == request.WriteToolName);
+        }
 
         DeterministicRefundChatClient.PlannedTools.Value = planned.Distinct().ToList();
         DeterministicRefundChatClient.FinalReply.Value = request.SuggestedReply;
+        DeterministicRefundChatClient.UserMessage.Value = request.Message;
+        DeterministicRefundChatClient.ConversationState.Value = request.ConversationState;
+        DeterministicRefundChatClient.PreferredWriteTool.Value =
+            request.RequireWriteApproval ? request.WriteToolName : null;
+        DeterministicRefundChatClient.AllowAutonomousToolSelection.Value = request.AllowAutonomousToolSelection;
 
-        var session = await agentHost.Agent.CreateSessionAsync(ct);
-        var sessionId = $"ags_{Guid.NewGuid():N}"[..20];
+        AgentSession? session;
+        string sessionId;
+        AgentSessionSnapshot? prior = null;
+
+        if (!string.IsNullOrWhiteSpace(request.ExistingSessionId))
+        {
+            prior = await sessionStore.GetAsync(request.ExistingSessionId!, ct);
+            if (prior is not null && !string.IsNullOrWhiteSpace(prior.SessionJson))
+            {
+                session = await agentHost.Agent.DeserializeSessionAsync(
+                    JsonDocument.Parse(prior.SessionJson).RootElement, cancellationToken: ct);
+                sessionId = request.ExistingSessionId!;
+                logger.LogInformation("Resuming agent session {Session}", sessionId);
+            }
+            else
+            {
+                session = await agentHost.Agent.CreateSessionAsync(ct);
+                sessionId = $"ags_{Guid.NewGuid():N}"[..20];
+                logger.LogWarning("Agent session {Session} missing; started new session {New}",
+                    request.ExistingSessionId, sessionId);
+            }
+        }
+        else
+        {
+            session = await agentHost.Agent.CreateSessionAsync(ct);
+            sessionId = $"ags_{Guid.NewGuid():N}"[..20];
+        }
 
         AgentResponse response;
         try
@@ -56,32 +90,31 @@ public sealed class AgentConversationService(
         var reply = string.IsNullOrWhiteSpace(response.Text) ? request.SuggestedReply : response.Text;
 
         var sessionJson = await agentHost.Agent.SerializeSessionAsync(session, cancellationToken: ct);
-        await sessionStore.SaveAsync(sessionId, new AgentSessionSnapshot
+        var snapshot = prior ?? new AgentSessionSnapshot();
+        snapshot.SessionJson = sessionJson.GetRawText();
+        snapshot.TraceId = request.TraceId;
+        snapshot.UserId = request.UserId;
+        snapshot.OrderId = request.OrderId;
+        snapshot.CaseId = request.CaseId;
+        snapshot.ScenarioId = request.ScenarioId;
+        snapshot.RiskLevel = request.RiskLevel.ToString();
+        snapshot.ConversationState = request.ConversationState;
+        snapshot.ConfirmationToken = request.ConfirmationToken;
+        snapshot.IdempotencyKey = request.IdempotencyKey;
+        snapshot.ExpectedOrderVersion = request.ExpectedOrderVersion;
+        snapshot.AmbientArguments = new Dictionary<string, object?>(request.AmbientArguments);
+        snapshot.PendingApprovals = pending.Select(p => new PendingApprovalRecord
         {
-            SessionJson = sessionJson.GetRawText(),
-            TraceId = request.TraceId,
-            UserId = request.UserId,
-            OrderId = request.OrderId,
-            CaseId = request.CaseId,
-            ScenarioId = request.ScenarioId,
-            RiskLevel = request.RiskLevel.ToString(),
-            ConversationState = request.ConversationState,
-            ConfirmationToken = request.ConfirmationToken,
-            IdempotencyKey = request.IdempotencyKey,
-            ExpectedOrderVersion = request.ExpectedOrderVersion,
-            AmbientArguments = new Dictionary<string, object?>(request.AmbientArguments),
-            PendingApprovals = pending.Select(p => new PendingApprovalRecord
-            {
-                RequestId = p.RequestId,
-                CallId = p.CallId,
-                ToolName = p.ToolName,
-                Arguments = p.Arguments.ToDictionary(kv => kv.Key, kv => kv.Value)
-            }).ToList()
-        }, ct);
+            RequestId = p.RequestId,
+            CallId = p.CallId,
+            ToolName = p.ToolName,
+            Arguments = p.Arguments.ToDictionary(kv => kv.Key, kv => kv.Value)
+        }).ToList();
+        await sessionStore.SaveAsync(sessionId, snapshot, ct);
 
         logger.LogInformation(
-            "Agent turn session={Session} pendingApprovals={Count} tools={Tools}",
-            sessionId, pending.Count, string.Join(',', toolsInvoked));
+            "Agent turn session={Session} resumed={Resumed} pendingApprovals={Count} tools={Tools}",
+            sessionId, prior is not null, pending.Count, string.Join(',', toolsInvoked));
 
         return new AgentTurnResult(sessionId, reply, pending.Count > 0, pending, toolsInvoked, true);
     }
@@ -121,6 +154,7 @@ public sealed class AgentConversationService(
             [approvalRequest.CreateResponse(request.Approved, request.Reason ?? (request.Approved ? "user approved" : "user rejected"))]);
 
         DeterministicRefundChatClient.PlannedTools.Value = [];
+        DeterministicRefundChatClient.AllowAutonomousToolSelection.Value = false;
         DeterministicRefundChatClient.FinalReply.Value = request.Approved
             ? $"已批准执行 {pending.ToolName}，业务写操作已提交。"
             : $"已拒绝执行 {pending.ToolName}，未改变业务状态。";
