@@ -270,12 +270,22 @@ public sealed class AgentOrchestrator(
             .Select(p => new PendingApprovalDto(p.RequestId, p.CallId, p.ToolName, p.Arguments, p.Description))
             .ToList();
 
+        decimal? refund = AmbientDec(snapshot, "refund");
+        decimal? fee = AmbientDec(snapshot, "fee");
+        var action = request.Approved ? "WriteApproved" : "WriteRejected";
+        var caseStatus = request.Approved
+            ? (pending.Count > 0 ? "WAITING_APPROVAL" : "REFUND_INITIATED")
+            : "AWAITING_USER";
+        var runId = $"apr_{Guid.NewGuid():N}"[..16];
+        var scenarioId = string.IsNullOrWhiteSpace(snapshot.ScenarioId) ? "A" : snapshot.ScenarioId;
+
         await store.AppendEventAsync(snapshot.CaseId, "function_approval", new
         {
             request.RequestId,
             request.Approved,
             request.Reason,
-            tools = agentTurn.ToolsInvoked
+            tools = agentTurn.ToolsInvoked,
+            pending = pending.Select(p => p.ToolName)
         }, ct);
 
         var steps = new List<DecisionStepDto>
@@ -288,23 +298,51 @@ public sealed class AgentOrchestrator(
                     : string.Join(',', agentTurn.ToolsInvoked))
         };
 
+        await store.UpsertCaseAsync(new RefundCase
+        {
+            CaseId = snapshot.CaseId,
+            OrderId = order.OrderId,
+            UserId = snapshot.UserId,
+            ScenarioId = scenarioId,
+            Status = caseStatus,
+            RiskLevel = risk,
+            Intent = "function_approval",
+            RecommendedAction = action,
+            QuoteRefundAmount = refund,
+            QuoteFeeAmount = fee,
+            ConversationState = snapshot.ConversationState,
+            UpdatedAt = DateTimeOffset.UtcNow
+        }, ct);
+
+        await store.SaveWorkflowRunAsync(new WorkflowRun
+        {
+            RunId = runId,
+            CaseId = snapshot.CaseId,
+            ScenarioId = scenarioId,
+            Status = agentTurn.HasPendingApprovals ? "WAITING_APPROVAL" : (request.Approved ? "COMPLETED" : "REJECTED"),
+            TraceJson = JsonSerializer.Serialize(steps),
+            ToolSequenceJson = JsonSerializer.Serialize(agentTurn.ToolsInvoked),
+            StartedAt = DateTimeOffset.UtcNow,
+            CompletedAt = DateTimeOffset.UtcNow
+        }, ct);
+
         var dto = new AgentDecisionDto(
             snapshot.TraceId,
-            $"apr_{Guid.NewGuid():N}"[..16],
+            runId,
             snapshot.CaseId,
-            string.IsNullOrWhiteSpace(snapshot.ScenarioId) ? "A" : snapshot.ScenarioId,
+            scenarioId,
             "function_approval",
             1.0,
             risk,
             risk == RiskLevel.L3 ? 90 : 40,
-            request.Approved ? "WriteApproved" : "WriteRejected",
+            action,
             agentTurn.Reply,
             request.Approved ? "写操作已批准" : "写操作已拒绝",
             agentTurn.Reply,
-            null, null,
+            refund, fee,
             agentTurn.Reply,
             snapshot.ConversationState,
-            request.Approved ? "REFUND_INITIATED" : "AWAITING_USER",
+            caseStatus,
             steps,
             new Dictionary<string, string>(),
             [],
@@ -312,7 +350,7 @@ public sealed class AgentOrchestrator(
             null,
             new HotelOrderDto(order.OrderId, order.HotelName, order.CheckIn, order.CheckOut, order.PaidAmount, order.Currency,
                 order.Status, order.UserOnSite, order.PolicyId, order.Version, order.RoomType, order.RoomCount),
-            true, Array.Empty<string>(),
+            false, Array.Empty<string>(),
             pending.Count > 0
                 ? new HitlStateDto(true, pending[0].ToolName, snapshot.ConfirmationToken,
                     "FunctionApproval (ToolApprovalRequestContent)")
@@ -324,7 +362,15 @@ public sealed class AgentOrchestrator(
             pending,
             production.Mode);
 
-        return dto;
+        var verification = verifier.VerifyDecision(dto);
+        return dto with { VerificationPassed = verification.Passed, VerificationViolations = verification.Violations };
+    }
+
+    private static decimal? AmbientDec(AgentSessionSnapshot snapshot, string key)
+    {
+        if (!snapshot.AmbientArguments.TryGetValue(key, out var v) || v is null) return null;
+        try { return Convert.ToDecimal(v); }
+        catch { return null; }
     }
 
     private static IReadOnlyList<TicketLifecycleStepDto> BuildTicketLifecycle(string action, RiskLevel risk, string caseStatus)
@@ -346,6 +392,7 @@ public sealed class AgentOrchestrator(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         yield return new AgentStreamEvent("status", "started");
+        yield return new AgentStreamEvent("status", "assembling_context");
 
         AgentDecisionDto? decision = null;
         string? error = null;
@@ -363,6 +410,8 @@ public sealed class AgentOrchestrator(
             yield return new AgentStreamEvent("error", error);
             yield break;
         }
+
+        yield return new AgentStreamEvent("status", "agent_completed");
 
         foreach (var step in decision!.Steps)
         {

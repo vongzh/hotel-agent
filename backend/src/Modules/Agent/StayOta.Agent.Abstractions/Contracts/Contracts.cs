@@ -209,7 +209,17 @@ public interface IConfirmationStore
 
 public interface IIdempotencyStore
 {
+    /// <summary>Reserve the idempotency key for an in-flight write. Returns false if already reserved or completed.</summary>
     Task<bool> TryBeginAsync(string key, TimeSpan ttl, CancellationToken ct = default);
+
+    /// <summary>Persist the successful write payload so duplicates can replay the same business result.</summary>
+    Task CompleteAsync(string key, string responseJson, TimeSpan ttl, CancellationToken ct = default);
+
+    /// <summary>Return completed response JSON, or null if missing / still in-flight.</summary>
+    Task<string?> TryGetCompletedAsync(string key, CancellationToken ct = default);
+
+    /// <summary>Release a begun key after a failed attempt so a retry can re-acquire.</summary>
+    Task AbandonAsync(string key, CancellationToken ct = default);
 }
 
 public interface ISessionStore

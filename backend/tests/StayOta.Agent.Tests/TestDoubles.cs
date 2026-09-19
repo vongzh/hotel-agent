@@ -67,10 +67,30 @@ internal sealed class MemoryConfirmationStore : IConfirmationStore
 
 internal sealed class MemoryIdempotencyStore : IIdempotencyStore
 {
-    private readonly ConcurrentDictionary<string, byte> _keys = new();
+    private readonly ConcurrentDictionary<string, string> _keys = new();
 
     public Task<bool> TryBeginAsync(string key, TimeSpan ttl, CancellationToken ct = default) =>
-        Task.FromResult(_keys.TryAdd(key, 0));
+        Task.FromResult(_keys.TryAdd(key, "pending"));
+
+    public Task CompleteAsync(string key, string responseJson, TimeSpan ttl, CancellationToken ct = default)
+    {
+        _keys[key] = responseJson;
+        return Task.CompletedTask;
+    }
+
+    public Task<string?> TryGetCompletedAsync(string key, CancellationToken ct = default)
+    {
+        if (!_keys.TryGetValue(key, out var v) || v == "pending")
+            return Task.FromResult<string?>(null);
+        return Task.FromResult<string?>(v);
+    }
+
+    public Task AbandonAsync(string key, CancellationToken ct = default)
+    {
+        if (_keys.TryGetValue(key, out var v) && v == "pending")
+            _keys.TryRemove(key, out _);
+        return Task.CompletedTask;
+    }
 }
 
 /// <summary>In-memory seed from repo mock/contracts — no Postgres required.</summary>

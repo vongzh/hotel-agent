@@ -98,7 +98,7 @@ public class ToolGatewayTests
     }
 
     [Fact]
-    public async Task Idempotency_SecondCallIsDuplicate()
+    public async Task Idempotency_SecondCallReplaysCachedPayload()
     {
         var (gateway, _, confirm) = GatewayFactory.Create();
         var token1 = await confirm.IssueAsync("CASE-A-001", "ORD-A-001", 1, "submit_cancellation", TimeSpan.FromMinutes(5));
@@ -112,6 +112,31 @@ public class ToolGatewayTests
         var second = await call(token2);
         Assert.True(first.Allowed && first.Success);
         Assert.True(second.Allowed && second.Success);
-        Assert.Contains("duplicate", second.Data?.ToString() ?? "", StringComparison.OrdinalIgnoreCase);
+        var secondJson = System.Text.Json.JsonSerializer.Serialize(second.Data);
+        Assert.Contains("duplicate", secondJson, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("replay", secondJson, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("refund_id", secondJson, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetActionResult_ReturnsCompletedIdempotentWrite()
+    {
+        var (gateway, _, confirm) = GatewayFactory.Create();
+        var token = await confirm.IssueAsync("CASE-A-001", "ORD-A-001", 1, "submit_cancellation", TimeSpan.FromMinutes(5));
+        var write = await gateway.InvokeAsync(new ToolCall(
+            "trc_test", "submit_cancellation", ToolAccess.Write, "USR-A", "ORD-A-001", "CASE-A-001",
+            RiskLevel.L1, "CONFIRMATION_REQUIRED", new Dictionary<string, object?>(),
+            ConfirmationToken: token, IdempotencyKey: "idem-lookup-1", ExpectedOrderVersion: 1));
+        Assert.True(write.Success);
+
+        var lookup = await gateway.InvokeAsync(new ToolCall(
+            "trc_test", "get_action_result", ToolAccess.Read, "USR-A", "ORD-A-001", "CASE-A-001",
+            RiskLevel.L1, "ACTION_IN_PROGRESS",
+            new Dictionary<string, object?> { ["idempotency_key"] = "idem-lookup-1" },
+            IdempotencyKey: "idem-lookup-1"));
+        Assert.True(lookup.Allowed && lookup.Success);
+        var json = System.Text.Json.JsonSerializer.Serialize(lookup.Data);
+        Assert.Contains("\"found\":true", json, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("SUCCEEDED", json, StringComparison.OrdinalIgnoreCase);
     }
 }
