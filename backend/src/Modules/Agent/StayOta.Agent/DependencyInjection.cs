@@ -43,22 +43,31 @@ public static class StayOtaAgentServiceCollectionExtensions
         services.AddSingleton<IAgentSessionStore, RedisAgentSessionStore>();
 
         services.AddSingleton<IChatClientFactory, ChatClientFactory>();
-        services.AddSingleton<IChatClient>(sp =>
+        services.AddScoped<DeterministicTurnContext>();
+        services.AddScoped<DeterministicRefundChatClient>();
+        services.AddScoped<IChatClient>(sp =>
         {
             var hostOpts = sp.GetRequiredService<IOptions<HostingOptions>>().Value;
-            try
+            var factory = sp.GetRequiredService<IChatClientFactory>();
+            var provider = factory.ProviderName;
+            if (provider is "openai" or "ollama")
             {
-                return sp.GetRequiredService<IChatClientFactory>().Create();
-            }
-            catch (Exception ex)
-            {
-                if (!hostOpts.AllowDeterministicFallback)
-                    throw;
+                try
+                {
+                    return factory.CreateRemote();
+                }
+                catch (Exception ex)
+                {
+                    if (!hostOpts.AllowDeterministicFallback)
+                        throw;
 
-                var logger = sp.GetService<ILoggerFactory>()?.CreateLogger("ChatClientRegistration");
-                logger?.LogWarning(ex, "Falling back to DeterministicRefundChatClient");
-                return new DeterministicRefundChatClient();
+                    var logger = sp.GetService<ILoggerFactory>()?.CreateLogger("ChatClientRegistration");
+                    logger?.LogWarning(ex, "Falling back to DeterministicRefundChatClient");
+                    return sp.GetRequiredService<DeterministicRefundChatClient>();
+                }
             }
+
+            return sp.GetRequiredService<DeterministicRefundChatClient>();
         });
 
         services.AddScoped<IRefundAgentHost, RefundAgentHost>();
