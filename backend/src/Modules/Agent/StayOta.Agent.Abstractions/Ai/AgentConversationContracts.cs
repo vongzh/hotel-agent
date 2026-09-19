@@ -25,7 +25,11 @@ public sealed record AgentTurnRequest(
     IDictionary<string, object?> AmbientArguments,
     string? ConfirmationToken = null,
     string? IdempotencyKey = null,
-    int? ExpectedOrderVersion = null);
+    int? ExpectedOrderVersion = null,
+    /// <summary>When set, deserialize and continue the prior ChatClientAgent session.</summary>
+    string? ExistingSessionId = null,
+    /// <summary>When PlannedTools is empty, Deterministic client may plan tools from the message.</summary>
+    bool AllowAutonomousToolSelection = true);
 
 public sealed record ApprovalResponseRequest(
     string SessionId,
