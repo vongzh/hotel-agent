@@ -36,6 +36,9 @@
 - 官方 FunctionApproval 流（待批 UI + `/api/agent/approvals`）
 - MCP 暴露 `/mcp` + 生产直连 `Mock|Http|Mcp`
 - 离线 Eval 支持工具子序列 / 动作 / 金额 / 禁语断言
+- Tool 失败重规划（门禁拒绝后回退候选 Tool）
+- 流式对话：`POST /api/agent/message/stream`（SSE：step / tool / reply_delta / done）
+- 政策检索：同义词 + 字符 bigram 相似 + 成交快照加权
 
 ## 启动
 

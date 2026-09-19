@@ -125,10 +125,13 @@ public sealed class AgentOrchestrator(
             if (scenario.ScenarioId == "K" && toolName == "create_human_handoff") toolState = "DECISION_READY";
             if ((scenario.ScenarioId is "E" or "L" or "D") && toolName == "create_human_handoff") toolState = "OPTION_PRESENTED";
 
-            var result = await tools.InvokeAsync(new ToolCall(
-                traceId, toolName, access, userId, order.OrderId, scenario.CaseId, decision.RiskLevel,
-                toolState, args, token, idem, version), ct);
-            if (result.Allowed) executed.Add(toolName);
+            var result = await InvokeWithReplanAsync(
+                tools, steps, executed,
+                new ToolCall(
+                    traceId, toolName, access, userId, order.OrderId, scenario.CaseId, decision.RiskLevel,
+                    toolState, args, token, idem, version),
+                decision.Action, decision.RiskLevel, ct);
+            _ = result;
         }
 
         await tools.InvokeAsync(new ToolCall(traceId, "calculate_refund_quote", ToolAccess.Read, userId, order.OrderId, scenario.CaseId, decision.RiskLevel, "DECISION_READY",
@@ -431,6 +434,106 @@ public sealed class AgentOrchestrator(
         ["confirm_recovery_outcome"] = "ESCALATED",
         ["reserve_mock_alternative"] = "OPTION_PRESENTED",
     };
+
+    public async IAsyncEnumerable<AgentStreamEvent> HandleStreamAsync(
+        AgentMessageRequest request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        yield return new AgentStreamEvent("status", "started");
+
+        AgentDecisionDto? decision = null;
+        string? error = null;
+        try
+        {
+            decision = await HandleAsync(request, ct);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+
+        if (error is not null)
+        {
+            yield return new AgentStreamEvent("error", error);
+            yield break;
+        }
+
+        foreach (var step in decision!.Steps)
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return new AgentStreamEvent("step", step.Step, step);
+            await Task.Yield();
+        }
+
+        foreach (var tool in decision.ToolSequence)
+            yield return new AgentStreamEvent("tool", tool);
+
+        if (decision.HasPendingApprovals)
+            yield return new AgentStreamEvent("approval_required", decision.AgentSessionId, decision.PendingApprovals);
+
+        foreach (var chunk in ChunkText(decision.Reply, 12))
+        {
+            ct.ThrowIfCancellationRequested();
+            yield return new AgentStreamEvent("reply_delta", chunk);
+            await Task.Delay(12, ct);
+        }
+
+        yield return new AgentStreamEvent("done", null, decision);
+    }
+
+    private static IEnumerable<string> ChunkText(string text, int size)
+    {
+        if (string.IsNullOrEmpty(text)) yield break;
+        for (var i = 0; i < text.Length; i += size)
+            yield return text[i..Math.Min(i + size, text.Length)];
+    }
+
+    private static async Task<ToolResult> InvokeWithReplanAsync(
+        IRefundAiToolCatalog tools,
+        List<DecisionStepDto> steps,
+        List<string> executed,
+        ToolCall call,
+        string decisionAction,
+        RiskLevel riskLevel,
+        CancellationToken ct)
+    {
+        var result = await tools.InvokeAsync(call, ct);
+        if (result.Allowed && result.Success)
+        {
+            if (!executed.Contains(call.ToolName)) executed.Add(call.ToolName);
+            return result;
+        }
+
+        steps.Add(new("Tool 失败", "warning", $"{call.ToolName}: {result.DenyReason ?? "denied"}"));
+        var suggestions = ToolFailureReplanner.Suggest(call.ToolName, result.DenyReason, decisionAction, riskLevel);
+        foreach (var suggestion in suggestions)
+        {
+            var retry = await tools.InvokeAsync(call with
+            {
+                ToolName = suggestion.ToolName,
+                ConversationState = suggestion.ConversationState,
+                Access = ToolGatewayWrite(suggestion.ToolName) ? ToolAccess.Write : ToolAccess.Read,
+                // Avoid blind write retries without tokens
+                ConfirmationToken = ToolGatewayWrite(suggestion.ToolName) ? call.ConfirmationToken : null,
+                IdempotencyKey = ToolGatewayWrite(suggestion.ToolName)
+                    ? (call.IdempotencyKey ?? $"replan-{suggestion.ToolName}-{Guid.NewGuid():N}"[..24])
+                    : null,
+                ExpectedOrderVersion = ToolGatewayWrite(suggestion.ToolName) ? call.ExpectedOrderVersion : null
+            }, ct);
+
+            if (retry.Allowed && retry.Success)
+            {
+                steps.Add(new("重规划", "success", $"{suggestion.Reason} → {suggestion.ToolName}"));
+                if (!executed.Contains(suggestion.ToolName)) executed.Add(suggestion.ToolName);
+                return retry;
+            }
+
+            steps.Add(new("重规划", "warning", $"候选 {suggestion.ToolName} 仍失败: {retry.DenyReason}"));
+        }
+
+        steps.Add(new("重规划", "error", $"{call.ToolName} 无可用回退"));
+        return result;
+    }
 
     private static bool NeedsEvidence(string scenarioId, AgentSignals signals) =>
         scenarioId is "G" || (scenarioId is "F" && !signals.HasNegotiationReason);

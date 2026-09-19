@@ -89,7 +89,11 @@ public interface IAgentOrchestrator
 {
     Task<AgentDecisionDto> HandleAsync(AgentMessageRequest request, CancellationToken ct = default);
     Task<AgentDecisionDto> RespondToApprovalAsync(FunctionApprovalRequest request, CancellationToken ct = default);
+    IAsyncEnumerable<AgentStreamEvent> HandleStreamAsync(AgentMessageRequest request, CancellationToken ct = default);
 }
+
+/// <summary>SSE / progressive agent events for streaming UX.</summary>
+public sealed record AgentStreamEvent(string Type, string? Text = null, object? Data = null);
 
 public sealed record HotelOrderDto(
     string OrderId,

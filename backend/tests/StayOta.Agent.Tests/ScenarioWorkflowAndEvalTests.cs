@@ -95,6 +95,14 @@ public class EvalRunnerTests
 
         public Task<AgentDecisionDto> RespondToApprovalAsync(FunctionApprovalRequest request, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public async IAsyncEnumerable<AgentStreamEvent> HandleStreamAsync(
+            AgentMessageRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            var decision = await HandleAsync(request, ct);
+            yield return new AgentStreamEvent("done", null, decision);
+        }
     }
 
     [Fact]
