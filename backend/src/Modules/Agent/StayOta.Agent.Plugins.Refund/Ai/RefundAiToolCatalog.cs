@@ -1,6 +1,7 @@
 using Microsoft.Extensions.AI;
 using StayOta.Agent.Abstractions.Ai;
 using StayOta.Agent.Abstractions.Contracts;
+using StayOta.Agent.Abstractions.Tools;
 using StayOta.Agent.Plugins.Refund.Services;
 
 namespace StayOta.Agent.Plugins.Refund.Ai;
@@ -12,11 +13,6 @@ namespace StayOta.Agent.Plugins.Refund.Ai;
 /// </summary>
 public sealed class RefundAiToolCatalog(IToolGateway gateway, IRefundDataStore store) : IRefundAiToolCatalog
 {
-    private static readonly HashSet<string> ConfirmRequired =
-    [
-        "submit_cancellation", "submit_order_change", "accept_supplier_offer", "reserve_mock_alternative"
-    ];
-
     private readonly Lazy<Dictionary<string, AIFunction>> _functions = new(() => BuildFunctions(gateway, store));
 
     public IReadOnlyDictionary<string, AIFunction> Functions => _functions.Value;
@@ -27,7 +23,7 @@ public sealed class RefundAiToolCatalog(IToolGateway gateway, IRefundDataStore s
             return _functions.Value.Values.Cast<AITool>().ToList();
 
         return _functions.Value.Select(kv =>
-            ConfirmRequired.Contains(kv.Key)
+            ToolPolicy.RequiresConfirmation(kv.Key)
                 ? (AITool)new ApprovalRequiredAIFunction(kv.Value)
                 : kv.Value).ToList();
     }

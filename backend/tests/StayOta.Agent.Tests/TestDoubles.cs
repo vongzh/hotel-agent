@@ -19,8 +19,8 @@ internal static class TestPaths
             if (!string.IsNullOrWhiteSpace(env) && Directory.Exists(env))
                 return env;
 
-            // tests/.../bin/Debug/net10.0 → repo root
-            var fromBin = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../"));
+            // tests/.../bin/Debug/net10.0 → repo root (6 levels up)
+            var fromBin = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../../"));
             if (File.Exists(Path.Combine(fromBin, "contracts/tool-contracts.json")))
                 return fromBin;
 
@@ -30,6 +30,7 @@ internal static class TestPaths
                          cwd,
                          Path.GetFullPath(Path.Combine(cwd, "..")),
                          Path.GetFullPath(Path.Combine(cwd, "../..")),
+                         Path.GetFullPath(Path.Combine(cwd, "../../..")),
                      })
             {
                 if (File.Exists(Path.Combine(c, "contracts/tool-contracts.json")))

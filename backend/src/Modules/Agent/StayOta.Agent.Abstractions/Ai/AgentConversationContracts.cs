@@ -18,7 +18,8 @@ public sealed record AgentTurnRequest(
     string ScenarioId,
     RiskLevel RiskLevel,
     string ConversationState,
-    IReadOnlyList<string> PlannedTools,
+    /// <summary>Soft tool hints (e.g. scenario required tools). Executed by Agent, not Orchestrator.</summary>
+    IReadOnlyList<string> HintTools,
     string SuggestedReply,
     bool RequireWriteApproval,
     string? WriteToolName,
@@ -26,9 +27,7 @@ public sealed record AgentTurnRequest(
     string? ConfirmationToken = null,
     string? IdempotencyKey = null,
     int? ExpectedOrderVersion = null,
-    /// <summary>When set, deserialize and continue the prior ChatClientAgent session.</summary>
     string? ExistingSessionId = null,
-    /// <summary>When PlannedTools is empty, Deterministic client may plan tools from the message.</summary>
     bool AllowAutonomousToolSelection = true);
 
 public sealed record ApprovalResponseRequest(

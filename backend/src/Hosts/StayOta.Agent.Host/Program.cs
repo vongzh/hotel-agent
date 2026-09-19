@@ -83,11 +83,11 @@ using (var scope = app.Services.CreateScope())
             await db.Database.ExecuteSqlRawAsync($"CREATE SCHEMA IF NOT EXISTS {schemaSql}");
 #pragma warning restore EF1002
         }
-        await db.Database.EnsureCreatedAsync();
+        await db.Database.MigrateAsync();
     }
     else
     {
-        await db.Database.EnsureCreatedAsync();
+        await db.Database.MigrateAsync();
     }
 
     if (hosting.SeedOnStartup)

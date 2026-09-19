@@ -4,18 +4,11 @@ using Microsoft.Extensions.AI;
 namespace StayOta.Agent.Ai;
 
 /// <summary>
-/// Offline / demo <see cref="IChatClient"/> that drives tool calling without a remote LLM.
-/// When <see cref="PlannedTools"/> is empty, selects tools via <see cref="ToolIntentPlanner"/>.
+/// Offline / demo <see cref="IChatClient"/>. Turn plan comes from scoped
+/// <see cref="DeterministicTurnContext"/> — no static AsyncLocal plan bus.
 /// </summary>
-public sealed class DeterministicRefundChatClient : IChatClient
+public sealed class DeterministicRefundChatClient(DeterministicTurnContext turnContext) : IChatClient
 {
-    public static AsyncLocal<IReadOnlyList<string>?> PlannedTools { get; } = new();
-    public static AsyncLocal<string?> FinalReply { get; } = new();
-    public static AsyncLocal<string?> UserMessage { get; } = new();
-    public static AsyncLocal<string?> ConversationState { get; } = new();
-    public static AsyncLocal<string?> PreferredWriteTool { get; } = new();
-    public static AsyncLocal<bool> AllowAutonomousToolSelection { get; } = new();
-
     public ChatClientMetadata Metadata { get; } = new("deterministic", new Uri("local://stayota-refund-agent"));
 
     public void Dispose()
@@ -64,26 +57,43 @@ public sealed class DeterministicRefundChatClient : IChatClient
             ]));
         }
 
-        var reply = FinalReply.Value ?? "退款助手已完成本轮决策（确定性 ChatClient，可替换为 Azure OpenAI / Foundry）。";
+        var reply = turnContext.Plan?.SuggestedReply
+                    ?? "退款助手已完成本轮决策（确定性 ChatClient，可替换为 Azure OpenAI / Foundry）。";
         return Task.FromResult(new ChatResponse([
             new ChatMessage(ChatRole.Assistant, reply)
         ]));
     }
 
-    private static IReadOnlyList<string> ResolvePlannedTools(IReadOnlyCollection<string> available)
+    private IReadOnlyList<string> ResolvePlannedTools(IReadOnlyCollection<string> available)
     {
-        var explicitPlan = PlannedTools.Value;
-        if (explicitPlan is { Count: > 0 })
-            return explicitPlan;
+        var plan = turnContext.Plan;
+        if (plan is null) return [];
 
-        if (!AllowAutonomousToolSelection.Value)
-            return [];
+        var planned = new List<string>();
 
-        return ToolIntentPlanner.Select(
-            UserMessage.Value ?? "",
-            ConversationState.Value ?? "",
-            available,
-            PreferredWriteTool.Value);
+        // Soft hints from scenario fixture (executed by Agent → Gateway, not Orchestrator)
+        if (plan.HintTools is { Count: > 0 })
+        {
+            planned.AddRange(plan.HintTools.Where(available.Contains).Distinct(StringComparer.Ordinal));
+        }
+        else if (plan.AllowAutonomousToolSelection)
+        {
+            planned.AddRange(ToolIntentPlanner.Select(
+                plan.UserMessage,
+                plan.ConversationState,
+                available,
+                preferredWriteTool: null));
+        }
+
+        // Append preferred write last so ApprovalRequiredAIFunction can surface HITL after reads.
+        if (!string.IsNullOrWhiteSpace(plan.PreferredWriteTool) &&
+            available.Contains(plan.PreferredWriteTool!) &&
+            !planned.Contains(plan.PreferredWriteTool!, StringComparer.Ordinal))
+        {
+            planned.Add(plan.PreferredWriteTool!);
+        }
+
+        return planned.Take(8).ToList();
     }
 
     public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(

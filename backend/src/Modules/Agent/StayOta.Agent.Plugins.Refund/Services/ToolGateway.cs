@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using StayOta.Agent.Abstractions.Contracts;
 using StayOta.Agent.Abstractions.Domain;
 using StayOta.Agent.Abstractions.Domain.Entities;
+using StayOta.Agent.Abstractions.Tools;
 
 namespace StayOta.Agent.Plugins.Refund.Services;
 
@@ -38,20 +39,6 @@ public sealed class ToolGateway(
     IIdempotencyStore idempotencyStore,
     ILogger<ToolGateway> logger) : IToolGateway
 {
-    private static readonly HashSet<string> WriteTools =
-    [
-        "submit_cancellation", "schedule_deadline_action", "create_payment_investigation",
-        "reserve_mock_alternative", "create_human_handoff", "confirm_recovery_outcome",
-        "create_supplier_case", "accept_supplier_offer", "submit_evidence_metadata",
-        "create_exception_review", "create_service_dispute_case", "submit_order_change",
-        "create_finance_case"
-    ];
-
-    private static readonly HashSet<string> ConfirmRequired =
-    [
-        "submit_cancellation", "submit_order_change", "accept_supplier_offer", "reserve_mock_alternative"
-    ];
-
     public IReadOnlyList<ToolContractDto> ListContracts() => store.GetToolContracts();
 
     public async Task<ToolResult> InvokeAsync(ToolCall call, CancellationToken ct = default)
@@ -72,12 +59,12 @@ public sealed class ToolGateway(
                 $"tool {call.ToolName} not allowed in state {call.ConversationState}", ct);
         }
 
-        var isWrite = WriteTools.Contains(call.ToolName);
+        var isWrite = ToolPolicy.IsWrite(call.ToolName);
 
         if (isWrite && call.RiskLevel == RiskLevel.L3 && call.ToolName is "submit_cancellation" or "submit_order_change")
             return await Audit(call, false, false, null, "L3 blocks auto financial write; escalate", ct);
 
-        if (isWrite && ConfirmRequired.Contains(call.ToolName))
+        if (isWrite && ToolPolicy.RequiresConfirmation(call.ToolName))
         {
             if (string.IsNullOrWhiteSpace(call.ConfirmationToken) || call.ExpectedOrderVersion is null ||
                 string.IsNullOrWhiteSpace(call.OrderId) || string.IsNullOrWhiteSpace(call.CaseId))

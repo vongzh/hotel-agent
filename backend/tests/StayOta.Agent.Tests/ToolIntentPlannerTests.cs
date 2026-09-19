@@ -43,14 +43,17 @@ public class ToolIntentPlannerTests
     [Fact]
     public async Task AutonomousDeterministicClient_CallsPlannedFromMessage()
     {
-        DeterministicRefundChatClient.PlannedTools.Value = [];
-        DeterministicRefundChatClient.AllowAutonomousToolSelection.Value = true;
-        DeterministicRefundChatClient.UserMessage.Value = "帮我取消酒店订单";
-        DeterministicRefundChatClient.ConversationState.Value = "DECISION_READY";
-        DeterministicRefundChatClient.FinalReply.Value = "ok";
-        DeterministicRefundChatClient.PreferredWriteTool.Value = null;
+        var turn = new DeterministicTurnContext();
+        turn.Set(new DeterministicTurnPlan
+        {
+            HintTools = [],
+            AllowAutonomousToolSelection = true,
+            UserMessage = "帮我取消酒店订单",
+            ConversationState = "DECISION_READY",
+            SuggestedReply = "ok"
+        });
 
-        var client = new DeterministicRefundChatClient();
+        var client = new DeterministicRefundChatClient(turn);
         var getOrder = AIFunctionFactory.Create(() => new { ok = true }, "get_order_detail", "order");
         var quote = AIFunctionFactory.Create(() => new { ok = true }, "calculate_refund_quote", "quote");
         var response = await client.GetResponseAsync(
@@ -61,5 +64,38 @@ public class ToolIntentPlannerTests
             .OfType<FunctionCallContent>().FirstOrDefault();
         Assert.NotNull(call);
         Assert.Equal("get_order_detail", call!.Name);
+    }
+
+    [Fact]
+    public async Task HintTools_PreferredWriteAppendedLast()
+    {
+        var turn = new DeterministicTurnContext();
+        turn.Set(new DeterministicTurnPlan
+        {
+            HintTools = ["get_order_detail"],
+            PreferredWriteTool = "submit_cancellation",
+            AllowAutonomousToolSelection = false,
+            SuggestedReply = "confirm"
+        });
+
+        var client = new DeterministicRefundChatClient(turn);
+        var getOrder = AIFunctionFactory.Create(() => new { ok = true }, "get_order_detail", "order");
+        var submit = AIFunctionFactory.Create(() => new { ok = true }, "submit_cancellation", "write");
+
+        // First call: hint read tool
+        var r1 = await client.GetResponseAsync(
+            [new ChatMessage(ChatRole.User, "x")],
+            new ChatOptions { Tools = [getOrder, submit] });
+        Assert.Equal("get_order_detail", r1.Messages.SelectMany(m => m.Contents).OfType<FunctionCallContent>().First().Name);
+
+        // After read completed: preferred write
+        var r2 = await client.GetResponseAsync(
+            [
+                new ChatMessage(ChatRole.User, "x"),
+                new ChatMessage(ChatRole.Assistant, [new FunctionCallContent("call_get_order_detail", "get_order_detail")]),
+                new ChatMessage(ChatRole.Tool, [new FunctionResultContent("call_get_order_detail", """{"ok":true}""")])
+            ],
+            new ChatOptions { Tools = [getOrder, submit] });
+        Assert.Equal("submit_cancellation", r2.Messages.SelectMany(m => m.Contents).OfType<FunctionCallContent>().First().Name);
     }
 }

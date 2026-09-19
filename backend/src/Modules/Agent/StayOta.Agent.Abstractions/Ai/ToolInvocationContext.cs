@@ -1,5 +1,6 @@
 using StayOta.Agent.Abstractions.Contracts;
 using StayOta.Agent.Abstractions.Domain;
+using StayOta.Agent.Abstractions.Tools;
 
 namespace StayOta.Agent.Abstractions.Ai;
 
@@ -16,6 +17,7 @@ public sealed class ToolInvocationContext
     public required string UserId { get; init; }
     public string? OrderId { get; init; }
     public string? CaseId { get; init; }
+    public string? ScenarioId { get; init; }
     public required RiskLevel RiskLevel { get; init; }
     public required string ConversationState { get; init; }
     public IDictionary<string, object?> Arguments { get; init; } = new Dictionary<string, object?>();
@@ -24,9 +26,21 @@ public sealed class ToolInvocationContext
     public int? ExpectedOrderVersion { get; init; }
     public ToolAccess Access { get; init; } = ToolAccess.Read;
 
-    public ToolCall ToToolCall(string toolName) => new(
-        TraceId, toolName, Access, UserId, OrderId, CaseId, RiskLevel, ConversationState,
-        Arguments, ConfirmationToken, IdempotencyKey, ExpectedOrderVersion);
+    /// <summary>
+    /// Builds a Gateway call using <see cref="ToolPolicy"/> for access + per-tool conversation state.
+    /// </summary>
+    public ToolCall ToToolCall(string toolName)
+    {
+        var access = ToolPolicy.AccessOf(toolName);
+        var state = ToolPolicy.StateFor(toolName, ScenarioId);
+        var idem = IdempotencyKey;
+        if (ToolPolicy.IsWrite(toolName) && string.IsNullOrWhiteSpace(idem))
+            idem = $"agent-{toolName}-{Guid.NewGuid():N}"[..28];
+
+        return new ToolCall(
+            TraceId, toolName, access, UserId, OrderId, CaseId, RiskLevel, state,
+            Arguments, ConfirmationToken, idem, ExpectedOrderVersion);
+    }
 
     public static IDisposable Push(ToolInvocationContext context)
     {

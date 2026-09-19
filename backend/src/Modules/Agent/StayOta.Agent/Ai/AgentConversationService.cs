@@ -5,12 +5,14 @@ using Microsoft.Extensions.Logging;
 using StayOta.Agent.Abstractions.Ai;
 using StayOta.Agent.Abstractions.Contracts;
 using StayOta.Agent.Abstractions.Domain;
+using StayOta.Agent.Abstractions.Tools;
 
 namespace StayOta.Agent.Ai;
 
 public sealed class AgentConversationService(
     IRefundAgentHost agentHost,
     IAgentSessionStore sessionStore,
+    DeterministicTurnContext turnContext,
     ILogger<AgentConversationService> logger) : IAgentConversationService
 {
     public async Task<AgentTurnResult> RunTurnAsync(AgentTurnRequest request, CancellationToken ct = default)
@@ -21,6 +23,7 @@ public sealed class AgentConversationService(
             UserId = request.UserId,
             OrderId = request.OrderId,
             CaseId = request.CaseId,
+            ScenarioId = request.ScenarioId,
             RiskLevel = request.RiskLevel,
             ConversationState = request.ConversationState,
             Arguments = request.AmbientArguments,
@@ -30,22 +33,35 @@ public sealed class AgentConversationService(
             Access = ToolAccess.Read
         });
 
-        // Prefer empty orchestrator plan so Deterministic/LLM selects tools; only force write for HITL.
-        var planned = request.PlannedTools.ToList();
-        if (request.RequireWriteApproval && !string.IsNullOrWhiteSpace(request.WriteToolName))
+        // Confirm-required writes never auto-hint — HITL via ApprovalRequired or post-confirm Gateway call.
+        var hints = request.HintTools
+            .Where(t => !ToolPolicy.RequiresConfirmation(t))
+            .Where(t => !request.RequireWriteApproval || t != request.WriteToolName)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        turnContext.Set(new DeterministicTurnPlan
         {
-            // Write stays approval-gated; do not auto-invoke — ApprovalRequiredAIFunction will surface HITL.
-            planned.RemoveAll(t => t == request.WriteToolName);
+            HintTools = hints,
+            SuggestedReply = request.SuggestedReply,
+            UserMessage = request.Message,
+            ConversationState = request.ConversationState,
+            PreferredWriteTool = request.RequireWriteApproval ? request.WriteToolName : null,
+            AllowAutonomousToolSelection = request.AllowAutonomousToolSelection && hints.Count == 0
+        });
+
+        try
+        {
+            return await RunCoreAsync(request, ct);
         }
+        finally
+        {
+            turnContext.Clear();
+        }
+    }
 
-        DeterministicRefundChatClient.PlannedTools.Value = planned.Distinct().ToList();
-        DeterministicRefundChatClient.FinalReply.Value = request.SuggestedReply;
-        DeterministicRefundChatClient.UserMessage.Value = request.Message;
-        DeterministicRefundChatClient.ConversationState.Value = request.ConversationState;
-        DeterministicRefundChatClient.PreferredWriteTool.Value =
-            request.RequireWriteApproval ? request.WriteToolName : null;
-        DeterministicRefundChatClient.AllowAutonomousToolSelection.Value = request.AllowAutonomousToolSelection;
-
+    private async Task<AgentTurnResult> RunCoreAsync(AgentTurnRequest request, CancellationToken ct)
+    {
         AgentSession? session;
         string sessionId;
         AgentSessionSnapshot? prior = null;
@@ -133,6 +149,7 @@ public sealed class AgentConversationService(
             UserId = snapshot.UserId,
             OrderId = snapshot.OrderId,
             CaseId = snapshot.CaseId,
+            ScenarioId = snapshot.ScenarioId,
             RiskLevel = Enum.TryParse<RiskLevel>(snapshot.RiskLevel, out var rl) ? rl : RiskLevel.L1,
             ConversationState = snapshot.ConversationState,
             Arguments = snapshot.AmbientArguments,
@@ -153,31 +170,43 @@ public sealed class AgentConversationService(
         var approvalMessage = new ChatMessage(ChatRole.User,
             [approvalRequest.CreateResponse(request.Approved, request.Reason ?? (request.Approved ? "user approved" : "user rejected"))]);
 
-        DeterministicRefundChatClient.PlannedTools.Value = [];
-        DeterministicRefundChatClient.AllowAutonomousToolSelection.Value = false;
-        DeterministicRefundChatClient.FinalReply.Value = request.Approved
+        var replyFallback = request.Approved
             ? $"已批准执行 {pending.ToolName}，业务写操作已提交。"
             : $"已拒绝执行 {pending.ToolName}，未改变业务状态。";
 
-        var response = await agentHost.Agent.RunAsync(approvalMessage, session, cancellationToken: ct);
-        var nextPending = ExtractApprovals(response);
-        var toolsInvoked = ExtractInvokedTools(response);
-        var reply = string.IsNullOrWhiteSpace(response.Text)
-            ? DeterministicRefundChatClient.FinalReply.Value!
-            : response.Text;
-
-        var sessionJson = await agentHost.Agent.SerializeSessionAsync(session, cancellationToken: ct);
-        snapshot.SessionJson = sessionJson.GetRawText();
-        snapshot.PendingApprovals = nextPending.Select(p => new PendingApprovalRecord
+        turnContext.Set(new DeterministicTurnPlan
         {
-            RequestId = p.RequestId,
-            CallId = p.CallId,
-            ToolName = p.ToolName,
-            Arguments = p.Arguments.ToDictionary(kv => kv.Key, kv => kv.Value)
-        }).ToList();
-        await sessionStore.SaveAsync(request.SessionId, snapshot, ct);
+            HintTools = [],
+            SuggestedReply = replyFallback,
+            AllowAutonomousToolSelection = false,
+            UserMessage = "",
+            ConversationState = snapshot.ConversationState
+        });
 
-        return new AgentTurnResult(request.SessionId, reply, nextPending.Count > 0, nextPending, toolsInvoked, true);
+        try
+        {
+            var response = await agentHost.Agent.RunAsync(approvalMessage, session, cancellationToken: ct);
+            var nextPending = ExtractApprovals(response);
+            var toolsInvoked = ExtractInvokedTools(response);
+            var reply = string.IsNullOrWhiteSpace(response.Text) ? replyFallback : response.Text;
+
+            var sessionJson = await agentHost.Agent.SerializeSessionAsync(session, cancellationToken: ct);
+            snapshot.SessionJson = sessionJson.GetRawText();
+            snapshot.PendingApprovals = nextPending.Select(p => new PendingApprovalRecord
+            {
+                RequestId = p.RequestId,
+                CallId = p.CallId,
+                ToolName = p.ToolName,
+                Arguments = p.Arguments.ToDictionary(kv => kv.Key, kv => kv.Value)
+            }).ToList();
+            await sessionStore.SaveAsync(request.SessionId, snapshot, ct);
+
+            return new AgentTurnResult(request.SessionId, reply, nextPending.Count > 0, nextPending, toolsInvoked, true);
+        }
+        finally
+        {
+            turnContext.Clear();
+        }
     }
 
     private static List<PendingToolApprovalDto> ExtractApprovals(AgentResponse response)

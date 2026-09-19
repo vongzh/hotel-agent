@@ -5,9 +5,14 @@ using StayOta.Agent.Abstractions.Contracts;
 using StayOta.Agent.Abstractions.Domain;
 using StayOta.Agent.Abstractions.Domain.Entities;
 using StayOta.Agent.Abstractions.Options;
+using StayOta.Agent.Abstractions.Tools;
 
 namespace StayOta.Agent.Plugins.Refund.Services;
 
+/// <summary>
+/// Thin orchestrator: route → intent → policy → rules → assemble context.
+/// Tool selection and execution belong to Agent → ToolGateway (sole execution surface).
+/// </summary>
 public sealed class AgentOrchestrator(
     IRefundDataStore store,
     IIntentService intentService,
@@ -61,12 +66,9 @@ public sealed class AgentOrchestrator(
         var missing = (signals.HasEvidence || !NeedsEvidence(scenario.ScenarioId, signals)) ? 0 : 1;
         steps.Add(new("槽位提取", missing > 0 ? "warning" : "success", missing > 0 ? $"缺失 {missing} 项" : "槽位完整"));
 
-        await tools.InvokeAsync(Read(traceId, "list_user_orders", userId, order, scenario, "INTENT_READY"), ct);
-        var orderTool = await tools.InvokeAsync(Read(traceId, "get_order_detail", userId, order, scenario, "ORDER_CONFIRMED"), ct);
-        steps.Add(new("订单查询", orderTool.Allowed ? "success" : "error", $"status={order.Status}, on_site={order.UserOnSite}, source={production.Mode}"));
+        steps.Add(new("订单查询", "success", $"status={order.Status}, on_site={order.UserOnSite}, source={production.Mode}"));
 
         var matches = retrieval.Retrieve(order, policy, analyzed.Reason);
-        await tools.InvokeAsync(Read(traceId, "get_policy_snapshot", userId, order, scenario, "ORDER_CONFIRMED"), ct);
         steps.Add(new("政策检索", "success", $"{matches[0].PolicyId} · score={matches[0].Score:0.00}"));
 
         var decision = rules.Evaluate(order, policy, scenario, signals);
@@ -74,11 +76,10 @@ public sealed class AgentOrchestrator(
         steps.Add(new("风险判断", "success", $"{decision.RiskLevel} · {decision.RiskScore}"));
 
         var requiredTools = JsonSerializer.Deserialize<List<string>>(scenario.RequiredToolsJson) ?? [];
-        var executed = new List<string>();
-        string? confirmationToken = null;
         var writeToolName = scenario.ScenarioId == "I" ? "submit_order_change" : "submit_cancellation";
         var deferWriteToFunctionApproval = decision.NeedsUserConfirm && !request.ConfirmWrite;
 
+        string? confirmationToken = null;
         if (decision.NeedsUserConfirm)
         {
             confirmationToken = await confirmationStore.IssueAsync(
@@ -87,87 +88,11 @@ public sealed class AgentOrchestrator(
                 TimeSpan.FromMinutes(10), ct);
         }
 
-        foreach (var toolName in requiredTools.Distinct())
-        {
-            var access = ToolGatewayWrite(toolName) ? ToolAccess.Write : ToolAccess.Read;
-            var args = new Dictionary<string, object?>
-            {
-                ["refund"] = decision.RefundAmount,
-                ["fee"] = decision.FeeAmount,
-                ["summary"] = decision.Conclusion,
-                ["reason"] = analyzed.Reason
-            };
-
-            string? token = null;
-            string? idem = null;
-            int? version = null;
-            if (toolName is "submit_cancellation" or "submit_order_change" or "accept_supplier_offer" or "reserve_mock_alternative")
-            {
-                // Defer confirm-required writes to official FunctionApproval when not yet confirmed.
-                if (deferWriteToFunctionApproval) continue;
-                if (!(request.ConfirmWrite && confirmationToken is not null)) continue;
-                token = request.ConfirmationToken ?? confirmationToken;
-                idem = request.IdempotencyKey ?? $"idem-{scenario.ScenarioId}-{order.OrderId}-{toolName}";
-                version = order.Version;
-            }
-
-            if (toolName is "submit_evidence_metadata" or "extract_evidence_fields" or "create_exception_review")
-            {
-                if (!signals.HasEvidence) continue;
-            }
-            if (toolName is "create_supplier_case" or "get_supplier_case" or "accept_supplier_offer")
-            {
-                if (decision.Action is "RequestInformation" or "RequestEvidence") continue;
-            }
-
-            var toolState = ToolStates.GetValueOrDefault(toolName, "DECISION_READY");
-            if (scenario.ScenarioId == "H" && toolName == "create_human_handoff") toolState = "WAITING_EXTERNAL";
-            if (scenario.ScenarioId == "K" && toolName == "create_human_handoff") toolState = "DECISION_READY";
-            if ((scenario.ScenarioId is "E" or "L" or "D") && toolName == "create_human_handoff") toolState = "OPTION_PRESENTED";
-
-            var result = await InvokeWithReplanAsync(
-                tools, steps, executed,
-                new ToolCall(
-                    traceId, toolName, access, userId, order.OrderId, scenario.CaseId, decision.RiskLevel,
-                    toolState, args, token, idem, version),
-                decision.Action, decision.RiskLevel, ct);
-            _ = result;
-        }
-
-        await tools.InvokeAsync(new ToolCall(traceId, "calculate_refund_quote", ToolAccess.Read, userId, order.OrderId, scenario.CaseId, decision.RiskLevel, "DECISION_READY",
-            new Dictionary<string, object?> { ["refund"] = decision.RefundAmount, ["fee"] = decision.FeeAmount }), ct);
-        await tools.InvokeAsync(new ToolCall(traceId, "validate_action_permission", ToolAccess.Read, userId, order.OrderId, scenario.CaseId, decision.RiskLevel, "DECISION_READY",
-            new Dictionary<string, object?> { ["action"] = decision.Action }), ct);
-
-        if (decision.Action is "HumanHandoff" or "Recovery" or "FinanceReview" or "ServiceDispute" or "SpecialReview")
-        {
-            var handoff = await tools.InvokeAsync(new ToolCall(traceId, "create_human_handoff", ToolAccess.Write, userId, order.OrderId, scenario.CaseId, decision.RiskLevel, scenario.ScenarioId switch { "H" => "WAITING_EXTERNAL", "K" => "DECISION_READY", _ => "OPTION_PRESENTED" },
-                new Dictionary<string, object?> { ["summary"] = decision.Conclusion }, IdempotencyKey: $"ho-{scenario.ScenarioId}-{runId}"), ct);
-            if (handoff.Allowed) executed.Add("create_human_handoff");
-        }
-        if (decision.Action == "NegotiateWithHotel")
-        {
-            await tools.InvokeAsync(Read(traceId, "build_supplier_case_draft", userId, order, scenario, "FACTS_REQUIRED"), ct);
-            await tools.InvokeAsync(new ToolCall(traceId, "create_supplier_case", ToolAccess.Write, userId, order.OrderId, scenario.CaseId, decision.RiskLevel, "CONFIRMATION_REQUIRED",
-                new Dictionary<string, object?>(), IdempotencyKey: $"sup-{scenario.ScenarioId}-{runId}"), ct);
-            executed.Add("create_supplier_case");
-        }
-        if (decision.Action == "ExplainProgress")
-        {
-            await tools.InvokeAsync(Read(traceId, "get_refund_status", userId, order, scenario, "TRACKING_REFUND"), ct);
-            await tools.InvokeAsync(new ToolCall(traceId, "schedule_deadline_action", ToolAccess.Write, userId, order.OrderId, scenario.CaseId, decision.RiskLevel, "TRACKING_REFUND",
-                new Dictionary<string, object?>(), IdempotencyKey: $"sch-{scenario.ScenarioId}-{runId}"), ct);
-        }
-        if ((decision.Action is "Recovery" or "HumanHandoff") && scenario.ScenarioId is "D" or "E")
-        {
-            await tools.InvokeAsync(Read(traceId, "verify_fulfillment_issue", userId, order, scenario, "DECISION_READY"), ct);
-            await tools.InvokeAsync(Read(traceId, "get_alternative_hotels", userId, order, scenario, "DECISION_READY"), ct);
-        }
-        if (signals.HasEvidence && scenario.ScenarioId is "G" or "F" or "H")
-        {
-            await tools.InvokeAsync(new ToolCall(traceId, "submit_evidence_metadata", ToolAccess.Write, userId, order.OrderId, scenario.CaseId, decision.RiskLevel, "FACTS_REQUIRED",
-                new Dictionary<string, object?> { ["evidence_type"] = "flight_cancel" }, IdempotencyKey: $"ev-{runId}"), ct);
-        }
+        // Soft hints only — Agent executes via Gateway. Confirm-required writes stay on HITL.
+        var hintTools = requiredTools
+            .Where(t => !ToolPolicy.RequiresConfirmation(t))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
 
         steps.Add(new("处理动作", "active", decision.Action));
 
@@ -210,9 +135,6 @@ public sealed class AgentOrchestrator(
             ["action"] = decision.Action
         };
 
-        // Agent selects tools (Deterministic planner / LLM). Orchestrator only hints write HITL.
-        var plannedForAgent = Array.Empty<string>();
-
         var agentTurn = await conversation.RunTurnAsync(new AgentTurnRequest(
             request.Message,
             traceId,
@@ -222,16 +144,16 @@ public sealed class AgentOrchestrator(
             scenario.ScenarioId,
             decision.RiskLevel,
             decision.ConversationState,
-            plannedForAgent,
+            hintTools,
             suggestedReply,
             deferWriteToFunctionApproval,
             deferWriteToFunctionApproval ? writeToolName : null,
             ambient,
             confirmationToken,
-            request.IdempotencyKey ?? (deferWriteToFunctionApproval ? $"idem-{scenario.ScenarioId}-{order.OrderId}-{writeToolName}" : null),
-            deferWriteToFunctionApproval ? order.Version : null,
+            request.IdempotencyKey ?? (decision.NeedsUserConfirm ? $"idem-{scenario.ScenarioId}-{order.OrderId}-{writeToolName}" : null),
+            decision.NeedsUserConfirm ? order.Version : null,
             request.AgentSessionId,
-            AllowAutonomousToolSelection: true), ct);
+            AllowAutonomousToolSelection: hintTools.Count == 0), ct);
 
         steps.Add(new(
             "Agent 驱动",
@@ -240,9 +162,28 @@ public sealed class AgentOrchestrator(
                 ? $"FunctionApproval 待批 ×{agentTurn.PendingApprovals.Count}; session={agentTurn.SessionId}"
                 : $"provider={agentHost.ProviderName}, tools={string.Join(',', agentTurn.ToolsInvoked)}, session={agentTurn.SessionId}"));
 
-        foreach (var t in agentTurn.ToolsInvoked)
+        var executed = agentTurn.ToolsInvoked.ToList();
+
+        // Confirmed write completes via Gateway only (no Orchestrator tool pre-loop).
+        if (request.ConfirmWrite && confirmationToken is not null && decision.NeedsUserConfirm)
         {
-            if (!executed.Contains(t)) executed.Add(t);
+            var writeCall = new ToolCall(
+                traceId, writeToolName, ToolAccess.Write, userId, order.OrderId, scenario.CaseId,
+                decision.RiskLevel, ToolPolicy.StateFor(writeToolName, scenario.ScenarioId),
+                ambient,
+                request.ConfirmationToken ?? confirmationToken,
+                request.IdempotencyKey ?? $"idem-{scenario.ScenarioId}-{order.OrderId}-{writeToolName}",
+                order.Version);
+            var writeResult = await tools.InvokeAsync(writeCall, ct);
+            if (writeResult.Allowed && writeResult.Success)
+            {
+                if (!executed.Contains(writeToolName)) executed.Add(writeToolName);
+                steps.Add(new("确认写操作", "success", writeToolName));
+            }
+            else
+            {
+                steps.Add(new("确认写操作", "error", writeResult.DenyReason ?? writeToolName));
+            }
         }
 
         var pendingApprovals = agentTurn.PendingApprovals
@@ -272,7 +213,8 @@ public sealed class AgentOrchestrator(
             executed,
             confirmationToken,
             agentSessionId = agentTurn.SessionId,
-            pendingApprovals = pendingApprovals.Select(p => p.ToolName)
+            pendingApprovals = pendingApprovals.Select(p => p.ToolName),
+            hintTools
         }, ct);
 
         var run = new WorkflowRun
@@ -293,9 +235,9 @@ public sealed class AgentOrchestrator(
             TimeSpan.FromHours(6), ct);
 
         logger.LogInformation(
-            "Scenario {Scenario} action {Action} aiProvider={Provider} agentDriven={Driven} pendingApprovals={Pending} production={Mode}",
+            "Scenario {Scenario} action {Action} aiProvider={Provider} agentDriven={Driven} pendingApprovals={Pending} production={Mode} hints={Hints}",
             scenario.ScenarioId, decision.Action, agentHost.ProviderName, agentTurn.AgentDriven,
-            pendingApprovals.Count, production.Mode);
+            pendingApprovals.Count, production.Mode, hintTools.Count);
 
         var dto = new AgentDecisionDto(
             traceId, runId, scenario.CaseId, scenario.ScenarioId,
@@ -399,42 +341,6 @@ public sealed class AgentOrchestrator(
         ];
     }
 
-    private static readonly Dictionary<string, string> ToolStates = new()
-    {
-        ["list_user_orders"] = "INTENT_READY",
-        ["get_order_detail"] = "ORDER_CONFIRMED",
-        ["get_policy_snapshot"] = "ORDER_CONFIRMED",
-        ["list_after_sale_events"] = "FACTS_REQUIRED",
-        ["calculate_refund_quote"] = "DECISION_READY",
-        ["validate_action_permission"] = "DECISION_READY",
-        ["submit_cancellation"] = "CONFIRMATION_REQUIRED",
-        ["get_refund_status"] = "TRACKING_REFUND",
-        ["get_payment_events"] = "TRACKING_REFUND",
-        ["schedule_deadline_action"] = "TRACKING_REFUND",
-        ["create_payment_investigation"] = "WAITING_EXTERNAL",
-        ["verify_fulfillment_issue"] = "ORDER_CONFIRMED",
-        ["get_alternative_hotels"] = "DECISION_READY",
-        ["get_guarantee_quote"] = "DECISION_READY",
-        ["create_human_handoff"] = "OPTION_PRESENTED",
-        ["build_supplier_case_draft"] = "FACTS_REQUIRED",
-        ["create_supplier_case"] = "CONFIRMATION_REQUIRED",
-        ["submit_evidence_metadata"] = "FACTS_REQUIRED",
-        ["extract_evidence_fields"] = "FACTS_REQUIRED",
-        ["create_exception_review"] = "DECISION_READY",
-        ["create_service_dispute_case"] = "DECISION_READY",
-        ["get_change_quote"] = "DECISION_READY",
-        ["submit_order_change"] = "CONFIRMATION_REQUIRED",
-        ["create_finance_case"] = "DECISION_READY",
-        ["get_responsibility_chain"] = "DECISION_READY",
-        ["get_group_order_breakdown"] = "FACTS_REQUIRED",
-        ["get_partial_cancel_quote"] = "DECISION_READY",
-        ["get_supplier_case"] = "WAITING_EXTERNAL",
-        ["accept_supplier_offer"] = "OPTION_PRESENTED",
-        ["get_handoff_status"] = "ESCALATED",
-        ["confirm_recovery_outcome"] = "ESCALATED",
-        ["reserve_mock_alternative"] = "OPTION_PRESENTED",
-    };
-
     public async IAsyncEnumerable<AgentStreamEvent> HandleStreamAsync(
         AgentMessageRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
@@ -488,62 +394,8 @@ public sealed class AgentOrchestrator(
             yield return text[i..Math.Min(i + size, text.Length)];
     }
 
-    private static async Task<ToolResult> InvokeWithReplanAsync(
-        IRefundAiToolCatalog tools,
-        List<DecisionStepDto> steps,
-        List<string> executed,
-        ToolCall call,
-        string decisionAction,
-        RiskLevel riskLevel,
-        CancellationToken ct)
-    {
-        var result = await tools.InvokeAsync(call, ct);
-        if (result.Allowed && result.Success)
-        {
-            if (!executed.Contains(call.ToolName)) executed.Add(call.ToolName);
-            return result;
-        }
-
-        steps.Add(new("Tool 失败", "warning", $"{call.ToolName}: {result.DenyReason ?? "denied"}"));
-        var suggestions = ToolFailureReplanner.Suggest(call.ToolName, result.DenyReason, decisionAction, riskLevel);
-        foreach (var suggestion in suggestions)
-        {
-            var retry = await tools.InvokeAsync(call with
-            {
-                ToolName = suggestion.ToolName,
-                ConversationState = suggestion.ConversationState,
-                Access = ToolGatewayWrite(suggestion.ToolName) ? ToolAccess.Write : ToolAccess.Read,
-                // Avoid blind write retries without tokens
-                ConfirmationToken = ToolGatewayWrite(suggestion.ToolName) ? call.ConfirmationToken : null,
-                IdempotencyKey = ToolGatewayWrite(suggestion.ToolName)
-                    ? (call.IdempotencyKey ?? $"replan-{suggestion.ToolName}-{Guid.NewGuid():N}"[..24])
-                    : null,
-                ExpectedOrderVersion = ToolGatewayWrite(suggestion.ToolName) ? call.ExpectedOrderVersion : null
-            }, ct);
-
-            if (retry.Allowed && retry.Success)
-            {
-                steps.Add(new("重规划", "success", $"{suggestion.Reason} → {suggestion.ToolName}"));
-                if (!executed.Contains(suggestion.ToolName)) executed.Add(suggestion.ToolName);
-                return retry;
-            }
-
-            steps.Add(new("重规划", "warning", $"候选 {suggestion.ToolName} 仍失败: {retry.DenyReason}"));
-        }
-
-        steps.Add(new("重规划", "error", $"{call.ToolName} 无可用回退"));
-        return result;
-    }
-
     private static bool NeedsEvidence(string scenarioId, AgentSignals signals) =>
         scenarioId is "G" || (scenarioId is "F" && !signals.HasNegotiationReason);
-
-    private static bool ToolGatewayWrite(string name) =>
-        name.StartsWith("submit_") || name.StartsWith("create_") || name.StartsWith("accept_") ||
-        name.StartsWith("reserve_") || name.StartsWith("confirm_") || name.StartsWith("schedule_");
-
-    private static ToolCall Read(string traceId, string tool, string userId, HotelOrder order, ScenarioFixture scenario, string state) =>
-        new(traceId, tool, ToolAccess.Read, userId, order.OrderId, scenario.CaseId, scenario.RiskLevel, state, new Dictionary<string, object?>());
 
     private static string BuildReply(RuleDecision d, HotelOrder order) => d.Action switch
     {
